@@ -1,0 +1,96 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: lab2-
+  namespace: argo
+  labels:
+    app: lab-pipeline
+spec:
+  entrypoint: main
+  ttlStrategy:
+    secondsAfterSuccess: 1800
+    secondsAfterFailure: 7200
+  podGC:
+    strategy: OnWorkflowSuccess
+
+  synchronization:
+    mutexes:
+      - name: "{{workflow.parameters.project_id}}-{{workflow.parameters.lab_id}}"
+
+  workflowMetadata:
+    labels:
+      lab: "{{workflow.parameters.lab_id}}"
+      project: "{{workflow.parameters.project_id}}"
+
+  arguments:
+    parameters:
+      - { name: lab_id,            value: lab2 }
+      - { name: project_id }
+      - { name: sa_id,             value: lab2-svc }
+      - { name: labs_bucket }
+      - { name: lab_path,          value: lab2 }
+      - { name: state_bucket }
+      - { name: state_prefix }
+      - { name: ksa_name }
+
+  templates:
+  - name: main
+    steps:
+      - - name: apply
+          template: tf-apply
+      - - name: validate
+          when: "{{steps.apply.status}} == Succeeded"
+          template: validate
+
+  - name: tf-apply
+    podSpecPatch: |
+      {
+        "serviceAccountName": "{{workflow.parameters.ksa_name}}",
+        "metadata": {
+          "labels": {
+            "lab": "{{workflow.parameters.lab_id}}",
+            "project": "{{workflow.parameters.project_id}}"
+          }
+        }
+      }
+    container:
+      image: gcr.io/google.com/cloudsdktool/google-cloud-cli:latest
+      command: [bash, -lc]
+      args:
+        - |
+          set -euo pipefail
+          apt-get update && apt-get install -y unzip >/dev/null
+          TF_VERSION=1.7.5
+          curl -fsSL https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip -o /tmp/tf.zip
+          unzip -o /tmp/tf.zip -d /usr/local/bin >/dev/null
+          mkdir -p /work/terraform
+          gsutil -m cp -r gs://{{workflow.parameters.labs_bucket}}/{{workflow.parameters.lab_path}}/terraform/* /work/terraform/
+          cd /work/terraform
+          terraform init \
+            -backend-config="bucket={{workflow.parameters.state_bucket}}" \
+            -backend-config="prefix={{workflow.parameters.state_prefix}}"
+          terraform apply -auto-approve \
+            -var "project_id={{workflow.parameters.project_id}}"
+
+  - name: validate
+    podSpecPatch: |
+      {
+        "serviceAccountName": "{{workflow.parameters.ksa_name}}",
+        "metadata": {
+          "labels": {
+            "lab": "{{workflow.parameters.lab_id}}",
+            "project": "{{workflow.parameters.project_id}}"
+          }
+        }
+      }
+    container:
+      image: gcr.io/google.com/cloudsdktool/google-cloud-cli:latest
+      command: [bash, -lc]
+      args:
+        - |
+          set -euo pipefail
+          apt-get update && apt-get install -y kubectl >/dev/null
+          mkdir -p /tmp/work
+          gsutil cp gs://{{workflow.parameters.labs_bucket}}/{{workflow.parameters.lab_path}}/validate.sh /tmp/work/validate.sh
+          chmod +x /tmp/work/validate.sh
+          /tmp/work/validate.sh "{{workflow.parameters.project_id}}"
